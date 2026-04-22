@@ -19,7 +19,7 @@
  *    GET  /classes                       All classes with their subjects
  *    GET  /chapters?classId=&subjectId=  Chapters for a class+subject
  *    GET  /posts?classId=&subjectId=&chapterId=   Posts (ordered oldest-first)
- *    GET  /posts/recent?classId=         Top 10 recent posts for a class
+ *    GET  /posts/recent        Top 10 recent posts
  *
  *  ENDPOINTS (admin – X-Admin-Secret header required):
  *    GET    /queue-stats                 Live queue metrics
@@ -446,19 +446,16 @@ app.get('/posts', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ENDPOINT 4 — GET /posts/recent?classId=
-//   Returns the 10 most recently created posts for a class
-//   (sorted newest-first).
+// ENDPOINT 4 — GET /posts/recent
+//   Returns the 10 most recently created posts across all classes
+//   (sorted newest-first). No parameters required.
 // ─────────────────────────────────────────────
 app.get('/posts/recent', async (req, res) => {
   try {
     const result = await QUEUES.read.add(async () => {
       requireDb();
-      requireQueryParams(req.query, 'classId');
-      const { classId } = req.query;
-
+      
       const snap = await db.collection('posts')
-        .where('classId', '==', classId)
         .orderBy('createdAt', 'desc')
         .limit(10)
         .get();
