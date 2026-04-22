@@ -26,7 +26,7 @@
  *    GET    /queue-stats                 Live queue metrics
  *    POST   /admin/cache/rebuild         Force full cache refresh
  *    GET    /visit-stats                 Visits: today / week / month / total
-
+ */
 'use strict';
 
 const express    = require('express');
