@@ -20,11 +20,12 @@
  *    GET  /chapters?classId=&subjectId=  Chapters for a class+subject
  *    GET  /posts?classId=&subjectId=&chapterId=   Posts (ordered oldest-first)
  *    GET  /posts/recent        Top 10 recent posts
+ *    POST /visit                         Record a site visit (public)
  *
  *  ENDPOINTS (admin – X-Admin-Secret header required):
  *    GET    /queue-stats                 Live queue metrics
  *    POST   /admin/cache/rebuild         Force full cache refresh
- */
+ *    GET    /visit-stats                 Visits: today / week / month / total
 
 'use strict';
 
@@ -474,6 +475,85 @@ app.get('/posts/recent', async (req, res) => {
         };
       });
     });
+    res.json(result);
+  } catch (err) {
+    handleError(err, res);
+  }
+});
+
+// ─────────────────────────────────────────────
+// ENDPOINT 5 — POST /visit
+//   Records a single site visit for today.
+//   Call this once per page load from your frontend.
+//   No auth required (public endpoint).
+// ─────────────────────────────────────────────
+app.post('/visit', async (req, res) => {
+  try {
+    await QUEUES.read.add(async () => {
+      requireDb();
+
+      const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+      const ref   = db.collection('site_visits').doc(today);
+
+      await ref.set(
+        { count: admin.firestore.FieldValue.increment(1), date: today },
+        { merge: true }
+      );
+    });
+
+    res.status(200).json({ success: true });
+  } catch (err) {
+    handleError(err, res);
+  }
+});
+
+// ─────────────────────────────────────────────
+// ENDPOINT 6 — GET /visit-stats
+//   Returns visit counts: today, this week, this month, total.
+//   Admin-only (requires X-Admin-Secret header).
+// ─────────────────────────────────────────────
+app.get('/visit-stats', requireAdminSecret, async (req, res) => {
+  try {
+    const result = await QUEUES.read.add(async () => {
+      requireDb();
+
+      const now        = new Date();
+      const todayStr   = now.toISOString().slice(0, 10); // "YYYY-MM-DD"
+
+      // Week start (Monday)
+      const dayOfWeek  = (now.getDay() + 6) % 7; // Mon=0 … Sun=6
+      const weekStart  = new Date(now);
+      weekStart.setDate(now.getDate() - dayOfWeek);
+      const weekStartStr = weekStart.toISOString().slice(0, 10);
+
+      // Month start
+      const monthStartStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+
+      // Pull all docs from month start onward (covers week + today too)
+      const snap = await db.collection('site_visits')
+        .where('date', '>=', monthStartStr)
+        .orderBy('date', 'asc')
+        .get();
+
+      let daily = 0, weekly = 0, monthly = 0;
+
+      snap.forEach(doc => {
+        const { date, count } = doc.data();
+        const n = Number(count) || 0;
+
+        monthly += n;
+        if (date >= weekStartStr)  weekly += n;
+        if (date === todayStr)     daily   = n;
+      });
+
+      // Total: one extra aggregation query (all-time)
+      const totalSnap = await db.collection('site_visits').get();
+      let total = 0;
+      totalSnap.forEach(doc => { total += Number(doc.data().count) || 0; });
+
+      return { daily, weekly, monthly, total, asOf: now.toISOString() };
+    });
+
     res.json(result);
   } catch (err) {
     handleError(err, res);
