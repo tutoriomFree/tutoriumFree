@@ -560,6 +560,21 @@ app.get('/visit-stats', requireAdminSecret, async (req, res) => {
   }
 });
 
+// ── GET /visit-count  (public – today's count only) ──
+app.get('/visit-count', async (req, res) => {
+  try {
+    const result = await QUEUES.read.add(async () => {
+      requireDb();
+      const today = new Date().toISOString().slice(0, 10);
+      const doc   = await db.collection('site_visits').doc(today).get();
+      return { count: doc.exists ? (Number(doc.data().count) || 0) : 0 };
+    });
+    res.json(result);
+  } catch (err) {
+    handleError(err, res);
+  }
+});
+
 // ─────────────────────────────────────────────
 // 404 fallback
 // ─────────────────────────────────────────────
