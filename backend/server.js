@@ -126,6 +126,7 @@ app.use(globalLimiter);
 const ID_REGEX   = /^[a-zA-Z0-9_\-@.+]{1,256}$/;
 // Allows letters, digits, spaces, and common punctuation – used for human-readable names
 const NAME_REGEX = /^[a-zA-Z0-9 _\-.,()&']{1,200}$/;
+const TITLE_REGEX = /^[\s\S]{1,500}$/;
 // URL validation (basic – allows http/https)
 const URL_REGEX  = /^https?:\/\/.{1,2000}$/;
 
@@ -971,7 +972,7 @@ app.post(
           postSubtitle,
           tutorName,
           videoUrl,
-          thumbnailUrl,
+          thumbnailUrl
         } = requireBodyFields(
           req.body,
           'classId',
@@ -980,9 +981,9 @@ app.post(
           'postTitle',
           'postSubtitle',
           'tutorName',
-          'videoUrl',
-          'thumbnailUrl'
+          'videoUrl'
         );
+        const thumbnailUrl = (req.body.thumbnailUrl || '').trim(); // optional, default empty string
 
         // Validate IDs
         validateId(classId,   'classId');
@@ -990,13 +991,13 @@ app.post(
         validateId(chapterId, 'chapterId');
 
         // Validate name fields
-        validateName(postTitle,    'postTitle');
-        validateName(postSubtitle, 'postSubtitle');
+        if (!TITLE_REGEX.test(postTitle))    throw new Error('BAD_REQUEST: Invalid or missing postTitle');
+        if (!TITLE_REGEX.test(postSubtitle)) throw new Error('BAD_REQUEST: Invalid or missing postSubtitle');
         validateName(tutorName,    'tutorName');
 
         // Validate URLs
         validateUrl(videoUrl,     'videoUrl');
-        validateUrl(thumbnailUrl, 'thumbnailUrl');
+        
 
         // Validate all parent references exist
         requireClassInCache(classId);
