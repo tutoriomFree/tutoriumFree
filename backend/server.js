@@ -1236,6 +1236,121 @@ app.delete(
   }
 );
 
+
+// ─────────────────────────────────────────────
+// ENDPOINT — GET /questions?classId=&subjectId=&chapterId=&after=
+//
+//  Returns 5 questions per page, ordered by questionOrder ascending.
+//  Designed for infinite / unlimited scroll via cursor-based pagination.
+//
+//  Query params:
+//    classId   (required) – filter
+//    subjectId (required) – filter
+//    chapterId (required) – filter
+//    after     (optional) – questionOrder cursor (last questionOrder value
+//                           received in the previous page). Omit for page 1.
+//
+//  Response 200:
+//    {
+//      "questions": [ ...up to 5 question objects ],
+//      "nextCursor": 6,     ← pass as ?after= in next request; null if no more pages
+//      "hasMore": true
+//    }
+//
+//  Each question object shape:
+//    {
+//      questionId, questionType, questionText, questionImageUrl,
+//      questionOptions,    ← included only if present in doc
+//      correctIndex, solutionText, solutionVideoUrl, solutionImageUrl,
+//      questionOrder, classId, subjectId, chapterId,
+//      createdAt, updatedAt
+//    }
+//
+//  Errors:
+//    400 – missing / invalid query params, or invalid cursor
+//    503 – queue full
+// ─────────────────────────────────────────────
+app.get('/questions', async (req, res) => {
+  try {
+    const result = await QUEUES.read.add(async () => {
+      requireDb();
+      requireQueryParams(req.query, 'classId', 'subjectId', 'chapterId');
+
+      const { classId, subjectId, chapterId } = req.query;
+
+      // ── Optional cursor (questionOrder of last item from previous page) ──
+      let afterCursor = null;
+      if (req.query.after !== undefined) {
+        const parsed = Number(req.query.after);
+        if (!Number.isFinite(parsed) || parsed < 0)
+          throw new Error('BAD_REQUEST: Invalid cursor value for "after"');
+        afterCursor = parsed;
+      }
+
+      const PAGE_SIZE = 5;
+
+      let query = db.collection('questions')
+        .where('classId',   '==', classId)
+        .where('subjectId', '==', subjectId)
+        .where('chapterId', '==', chapterId)
+        .orderBy('questionOrder', 'asc')
+        .limit(PAGE_SIZE + 1); // fetch one extra to determine hasMore
+
+      if (afterCursor !== null) {
+        query = query.startAfter(afterCursor);
+      }
+
+      const snap = await query.get();
+      const docs = snap.docs;
+
+      const hasMore   = docs.length > PAGE_SIZE;
+      const pageDocs  = hasMore ? docs.slice(0, PAGE_SIZE) : docs;
+
+      const questions = pageDocs.map(doc => {
+        const d = doc.data();
+
+        const question = {
+          questionId:       String(d.questionId       ?? doc.id),
+          questionType:     String(d.questionType     ?? ''),
+          questionText:     String(d.questionText     ?? ''),
+          questionImageUrl: String(d.questionImageUrl ?? ''),
+          correctIndex:     d.correctIndex ?? null,
+          questionOrder:    d.questionOrder ?? null,
+          classId:          String(d.classId   ?? ''),
+          subjectId:        String(d.subjectId ?? ''),
+          chapterId:        String(d.chapterId ?? ''),
+          createdAt:        d.createdAt?.toDate?.()?.toISOString() ?? null,
+          updatedAt:        d.updatedAt?.toDate?.()?.toISOString() ?? null,
+        };
+
+        // Optional fields — only include if present in the document
+        if (d.questionOptions !== undefined) question.questionOptions  = d.questionOptions;
+        if (d.solutionText    !== undefined) question.solutionText     = String(d.solutionText);
+        if (d.solutionVideoUrl !== undefined) question.solutionVideoUrl = String(d.solutionVideoUrl);
+        if (d.solutionImageUrl !== undefined) question.solutionImageUrl = String(d.solutionImageUrl);
+
+        return question;
+      });
+
+      const lastDoc    = pageDocs[pageDocs.length - 1];
+      const nextCursor = hasMore
+        ? (lastDoc?.data().questionOrder ?? null)
+        : null;
+
+      logger.info(
+        { classId, subjectId, chapterId, returned: questions.length, hasMore },
+        '✅ Questions fetched'
+      );
+
+      return { questions, nextCursor, hasMore };
+    });
+
+    res.json(result);
+  } catch (err) {
+    handleError(err, res);
+  }
+});
+
 // ─────────────────────────────────────────────
 // 404 fallback
 // ─────────────────────────────────────────────
