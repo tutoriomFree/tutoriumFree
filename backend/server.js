@@ -35,6 +35,9 @@
  *    PUT    /admin/posts                  Edit an existing post by postId in body
  *    DELETE /admin/posts                  Delete a post by postId in body
  */
+//    POST   /admin/questions     Bulk-create questions (array in body)
+//    PUT    /admin/questions     Edit a single question by questionId in body
+//    DELETE /admin/questions     Delete a question by questionId in body
 'use strict';
 
 const express   = require('express');
@@ -1350,6 +1353,408 @@ app.get('/questions', async (req, res) => {
     handleError(err, res);
   }
 });
+
+// ─────────────────────────────────────────────
+// ADMIN ENDPOINT — POST /admin/questions
+//
+//  Bulk-creates question documents from a JSON array.
+//  Each question is validated individually; the entire
+//  batch is rejected if ANY question fails validation.
+//
+//  Request body:
+//    {
+//      "classId":   "...",   ← applied to ALL questions
+//      "subjectId": "...",
+//      "chapterId": "...",
+//      "questions": [
+//        {
+//          "questionType":     "Objective" | "Subjective",  ← required
+//          "questionText":     "...",                       ← required
+//          "questionImageUrl": "https://...",               ← optional
+//          "questionOptions":  ["A","B","C","D"],           ← required if Objective
+//          "correctIndex":     0,                           ← required if Objective
+//          "solutionText":     "...",                       ← optional
+//          "solutionVideoUrl": "https://...",               ← optional
+//          "solutionImageUrl": "https://...",               ← optional
+//          "questionOrder":    1                            ← required, integer ≥ 0
+//        },
+//        ...
+//      ]
+//    }
+//
+//  ID format: question_{rand10}
+//
+//  Response 201:
+//    { "success": true, "created": 5, "questions": [ ...created docs ] }
+//
+//  Errors:
+//    400 – missing/invalid fields in any question
+//    404 – classId / subjectId / chapterId not found
+// ─────────────────────────────────────────────
+app.post(
+  '/admin/questions',
+  requireAdminSecret,
+  adminWriteLimiter,
+  async (req, res) => {
+    try {
+      const result = await QUEUES.write.add(async () => {
+        requireDb();
+
+        // ── Top-level required fields ──────────────────────
+        const { classId, subjectId, chapterId } = requireBodyFields(
+          req.body,
+          'classId',
+          'subjectId',
+          'chapterId'
+        );
+
+        validateId(classId,   'classId');
+        validateId(subjectId, 'subjectId');
+        validateId(chapterId, 'chapterId');
+
+        requireClassInCache(classId);
+        requireSubjectInCache(classId, subjectId);
+        requireChapterInCache(classId, subjectId, chapterId);
+
+        // ── Validate questions array ───────────────────────
+        const rawQuestions = req.body.questions;
+
+        if (!Array.isArray(rawQuestions) || rawQuestions.length === 0)
+          throw new Error('BAD_REQUEST: "questions" must be a non-empty array');
+
+        if (rawQuestions.length > 200)
+          throw new Error('BAD_REQUEST: Maximum 200 questions per request');
+
+        const VALID_TYPES = new Set(['Objective', 'Subjective']);
+
+        // Validate all questions up-front before writing anything
+        for (let i = 0; i < rawQuestions.length; i++) {
+          const q   = rawQuestions[i];
+          const idx = `questions[${i}]`;
+
+          if (!q || typeof q !== 'object')
+            throw new Error(`BAD_REQUEST: ${idx} must be an object`);
+
+          if (!VALID_TYPES.has(q.questionType))
+            throw new Error(`BAD_REQUEST: ${idx}.questionType must be "Objective" or "Subjective"`);
+
+          if (!q.questionText || typeof q.questionText !== 'string' || !q.questionText.trim())
+            throw new Error(`BAD_REQUEST: ${idx}.questionText is required`);
+
+          if (typeof q.questionOrder !== 'number' || !Number.isInteger(q.questionOrder) || q.questionOrder < 0)
+            throw new Error(`BAD_REQUEST: ${idx}.questionOrder must be a non-negative integer`);
+
+          // Objective-specific validation
+          if (q.questionType === 'Objective') {
+            if (!Array.isArray(q.questionOptions) || q.questionOptions.length < 2)
+              throw new Error(`BAD_REQUEST: ${idx}.questionOptions must be an array of ≥2 items for Objective questions`);
+
+            for (let oi = 0; oi < q.questionOptions.length; oi++) {
+              if (typeof q.questionOptions[oi] !== 'string' || !q.questionOptions[oi].trim())
+                throw new Error(`BAD_REQUEST: ${idx}.questionOptions[${oi}] must be a non-empty string`);
+            }
+
+            if (
+              typeof q.correctIndex !== 'number' ||
+              !Number.isInteger(q.correctIndex) ||
+              q.correctIndex < 0 ||
+              q.correctIndex >= q.questionOptions.length
+            ) {
+              throw new Error(
+                `BAD_REQUEST: ${idx}.correctIndex must be a valid index into questionOptions`
+              );
+            }
+          }
+
+          // Optional URL fields
+          if (q.questionImageUrl  !== undefined) validateUrl(q.questionImageUrl,  `${idx}.questionImageUrl`);
+          if (q.solutionVideoUrl  !== undefined) validateUrl(q.solutionVideoUrl,  `${idx}.solutionVideoUrl`);
+          if (q.solutionImageUrl  !== undefined) validateUrl(q.solutionImageUrl,  `${idx}.solutionImageUrl`);
+        }
+
+        // ── Batch write ────────────────────────────────────
+        const batch    = db.batch();
+        const created  = [];
+        const now      = admin.firestore.FieldValue.serverTimestamp();
+
+        for (const q of rawQuestions) {
+          const questionId = `question_${rand10()}`;
+
+          const docData = {
+            questionId,
+            questionType:  q.questionType,
+            questionText:  q.questionText.trim(),
+            questionOrder: q.questionOrder,
+            classId,
+            subjectId,
+            chapterId,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+          // Optional fields — only write if provided
+          if (q.questionImageUrl !== undefined) docData.questionImageUrl = q.questionImageUrl.trim();
+          if (q.solutionText     !== undefined) docData.solutionText     = String(q.solutionText).trim();
+          if (q.solutionVideoUrl !== undefined) docData.solutionVideoUrl = q.solutionVideoUrl.trim();
+          if (q.solutionImageUrl !== undefined) docData.solutionImageUrl = q.solutionImageUrl.trim();
+
+          // Objective-specific
+          if (q.questionType === 'Objective') {
+            docData.questionOptions = q.questionOptions.map(o => String(o).trim());
+            docData.correctIndex    = q.correctIndex;
+          }
+
+          batch.set(db.collection('questions').doc(questionId), docData);
+
+          created.push({ questionId, ...docData, createdAt: null, updatedAt: null });
+        }
+
+        await batch.commit();
+        logger.info({ classId, subjectId, chapterId, count: created.length }, '✅ Questions bulk created');
+
+        return { success: true, created: created.length, questions: created };
+      });
+
+      res.status(201).json(result);
+    } catch (err) {
+      handleError(err, res);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────
+// ADMIN ENDPOINT — PUT /admin/questions
+//
+//  Edits a single question. Patch semantics — only
+//  provided fields are updated. questionId is required.
+//
+//  Request body (questionId required; all others optional):
+//    {
+//      "questionId":       "question_3847201956",   ← required
+//      "questionType":     "Objective",             ← optional
+//      "questionText":     "...",                   ← optional
+//      "questionImageUrl": "https://...",           ← optional, send "" to clear
+//      "questionOptions":  ["A","B","C","D"],       ← optional
+//      "correctIndex":     2,                       ← optional
+//      "solutionText":     "...",                   ← optional
+//      "solutionVideoUrl": "https://...",           ← optional, send "" to clear
+//      "solutionImageUrl": "https://...",           ← optional, send "" to clear
+//      "questionOrder":    3,                       ← optional
+//      "classId":          "...",                   ← optional (re-assign)
+//      "subjectId":        "...",                   ← optional (re-assign)
+//      "chapterId":        "..."                    ← optional (re-assign)
+//    }
+//
+//  Response 200:
+//    { "success": true, "questionId": "...", "updated": { ...changedFields }, "current": { ... } }
+//
+//  Errors:
+//    400 – missing questionId or invalid field values
+//    404 – question not found
+// ─────────────────────────────────────────────
+app.put(
+  '/admin/questions',
+  requireAdminSecret,
+  adminWriteLimiter,
+  async (req, res) => {
+    try {
+      const result = await QUEUES.write.add(async () => {
+        requireDb();
+
+        const { questionId } = requireBodyFields(req.body, 'questionId');
+        validateId(questionId, 'questionId');
+
+        // Confirm question exists
+        const docRef  = db.collection('questions').doc(questionId);
+        const docSnap = await docRef.get();
+        if (!docSnap.exists)
+          throw new Error(`NOT_FOUND: Question with questionId "${questionId}" does not exist`);
+
+        const existingData = docSnap.data();
+        const updates      = {};
+
+        // ── Scalar text fields ─────────────────────────────
+        if (req.body.questionText !== undefined) {
+          if (typeof req.body.questionText !== 'string' || !req.body.questionText.trim())
+            throw new Error('BAD_REQUEST: questionText must be a non-empty string');
+          updates.questionText = req.body.questionText.trim();
+        }
+
+        if (req.body.questionType !== undefined) {
+          if (!['Objective', 'Subjective'].includes(req.body.questionType))
+            throw new Error('BAD_REQUEST: questionType must be "Objective" or "Subjective"');
+          updates.questionType = req.body.questionType;
+        }
+
+        if (req.body.questionOrder !== undefined) {
+          const qo = req.body.questionOrder;
+          if (typeof qo !== 'number' || !Number.isInteger(qo) || qo < 0)
+            throw new Error('BAD_REQUEST: questionOrder must be a non-negative integer');
+          updates.questionOrder = qo;
+        }
+
+        if (req.body.solutionText !== undefined) {
+          updates.solutionText = String(req.body.solutionText).trim();
+        }
+
+        // ── Optional URL fields (empty string = clear the field) ──
+        for (const field of ['questionImageUrl', 'solutionVideoUrl', 'solutionImageUrl']) {
+          if (req.body[field] !== undefined) {
+            if (req.body[field] === '') {
+              updates[field] = admin.firestore.FieldValue.delete();
+            } else {
+              validateUrl(req.body[field], field);
+              updates[field] = req.body[field].trim();
+            }
+          }
+        }
+
+        // ── Objective-specific fields ──────────────────────
+        const resolvedType = updates.questionType ?? existingData.questionType;
+
+        if (req.body.questionOptions !== undefined) {
+          if (!Array.isArray(req.body.questionOptions) || req.body.questionOptions.length < 2)
+            throw new Error('BAD_REQUEST: questionOptions must be an array of ≥2 items');
+          for (let i = 0; i < req.body.questionOptions.length; i++) {
+            if (typeof req.body.questionOptions[i] !== 'string' || !req.body.questionOptions[i].trim())
+              throw new Error(`BAD_REQUEST: questionOptions[${i}] must be a non-empty string`);
+          }
+          updates.questionOptions = req.body.questionOptions.map(o => String(o).trim());
+        }
+
+        if (req.body.correctIndex !== undefined) {
+          const ci      = req.body.correctIndex;
+          const optLen  = (updates.questionOptions ?? existingData.questionOptions ?? []).length;
+          if (typeof ci !== 'number' || !Number.isInteger(ci) || ci < 0 || ci >= optLen)
+            throw new Error('BAD_REQUEST: correctIndex must be a valid index into questionOptions');
+          updates.correctIndex = ci;
+        }
+
+        // Guard: if switching to Objective, ensure options + correctIndex are present
+        if (resolvedType === 'Objective') {
+          const hasOptions = updates.questionOptions ?? existingData.questionOptions;
+          const hasIndex   = updates.correctIndex    ?? existingData.correctIndex;
+          if (!hasOptions || hasOptions.length < 2)
+            throw new Error('BAD_REQUEST: Objective questions require questionOptions (≥2 items)');
+          if (typeof hasIndex !== 'number')
+            throw new Error('BAD_REQUEST: Objective questions require a valid correctIndex');
+        }
+
+        // ── Re-assignment of classId / subjectId / chapterId ──
+        const hasNewClass   = req.body.classId   !== undefined;
+        const hasNewSubject = req.body.subjectId !== undefined;
+        const hasNewChapter = req.body.chapterId !== undefined;
+
+        if (hasNewClass || hasNewSubject || hasNewChapter) {
+          // All three must be supplied together
+          if (!hasNewClass || !hasNewSubject || !hasNewChapter)
+            throw new Error('BAD_REQUEST: classId, subjectId, and chapterId must all be provided together when re-assigning');
+
+          const newClassId   = String(req.body.classId).trim();
+          const newSubjectId = String(req.body.subjectId).trim();
+          const newChapterId = String(req.body.chapterId).trim();
+
+          validateId(newClassId,   'classId');
+          validateId(newSubjectId, 'subjectId');
+          validateId(newChapterId, 'chapterId');
+
+          requireClassInCache(newClassId);
+          requireSubjectInCache(newClassId, newSubjectId);
+          requireChapterInCache(newClassId, newSubjectId, newChapterId);
+
+          updates.classId   = newClassId;
+          updates.subjectId = newSubjectId;
+          updates.chapterId = newChapterId;
+        }
+
+        if (Object.keys(updates).length === 0)
+          throw new Error('BAD_REQUEST: No updatable fields provided');
+
+        updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+
+        await docRef.update(updates);
+        logger.info({ questionId, updates: Object.keys(updates) }, '✅ Question updated');
+
+        // Build a clean response (strip FieldValue sentinels)
+        const responseUpdates = Object.fromEntries(
+          Object.entries(updates).filter(
+            ([k, v]) => k !== 'updatedAt' && !(v && typeof v === 'object' && v._methodName === 'FieldValue.delete')
+          )
+        );
+
+        return {
+          success:    true,
+          questionId,
+          updated:    responseUpdates,
+          current: {
+            ...existingData,
+            ...responseUpdates,
+            questionId,
+            createdAt: existingData.createdAt?.toDate?.()?.toISOString() ?? null,
+          },
+        };
+      });
+
+      res.status(200).json(result);
+    } catch (err) {
+      handleError(err, res);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────
+// ADMIN ENDPOINT — DELETE /admin/questions
+//
+//  Permanently deletes a single question by questionId.
+//
+//  Request body:
+//    { "questionId": "question_3847201956" }
+//
+//  Steps:
+//    1. Validate questionId
+//    2. Confirm document exists (prevents silent no-ops)
+//    3. Delete from Firestore
+//
+//  Response 200:
+//    { "success": true, "message": "Question question_... deleted successfully.", "questionId": "..." }
+//
+//  Errors:
+//    400 – missing or invalid questionId
+//    404 – question not found
+// ─────────────────────────────────────────────
+app.delete(
+  '/admin/questions',
+  requireAdminSecret,
+  adminWriteLimiter,
+  async (req, res) => {
+    try {
+      const result = await QUEUES.write.add(async () => {
+        requireDb();
+
+        const { questionId } = requireBodyFields(req.body, 'questionId');
+        validateId(questionId, 'questionId');
+
+        const docRef  = db.collection('questions').doc(questionId);
+        const docSnap = await docRef.get();
+        if (!docSnap.exists)
+          throw new Error(`NOT_FOUND: Question with questionId "${questionId}" does not exist`);
+
+        await docRef.delete();
+        logger.info({ questionId }, '🗑️  Question deleted');
+
+        return {
+          success: true,
+          message: `Question ${questionId} deleted successfully.`,
+          questionId,
+        };
+      });
+
+      res.status(200).json(result);
+    } catch (err) {
+      handleError(err, res);
+    }
+  }
+);
 
 // ─────────────────────────────────────────────
 // 404 fallback
