@@ -128,7 +128,7 @@ app.use(globalLimiter);
 // ─────────────────────────────────────────────
 const ID_REGEX   = /^[a-zA-Z0-9_\-@.+]{1,256}$/;
 // Allows letters, digits, spaces, and common punctuation – used for human-readable names
-const NAME_REGEX = /^[a-zA-Z0-9 _\-.,()&']{1,200}$/;
+const NAME_MAX_LENGTH = 200;
 // URL validation (basic – allows http/https)
 const URL_REGEX  = /^https?:\/\/.{1,2000}$/;
 
@@ -139,8 +139,11 @@ function validateId(value, name) {
 }
 
 function validateName(value, name) {
-  if (!value || typeof value !== 'string' || !NAME_REGEX.test(value.trim())) {
+  if (!value || typeof value !== 'string' || !value.trim()) {
     throw new Error(`BAD_REQUEST: Invalid or missing ${name}`);
+  }
+  if (value.trim().length > NAME_MAX_LENGTH) {
+    throw new Error(`BAD_REQUEST: ${name} must be 200 characters or fewer`);
   }
 }
 
