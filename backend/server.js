@@ -1559,7 +1559,8 @@ app.post(
           created:   createdCount,
           updated:   updatedCount,
           questions: results,
-};
+        };
+      });
 
       res.status(201).json(result);
     } catch (err) {
