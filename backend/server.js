@@ -1475,48 +1475,91 @@ app.post(
           if (q.solutionImageUrl  !== undefined) validateUrl(q.solutionImageUrl,  `${idx}.solutionImageUrl`);
         }
 
-        // ── Batch write ────────────────────────────────────
-        const batch    = db.batch();
-        const created  = [];
-        const now      = admin.firestore.FieldValue.serverTimestamp();
+        // ── Duplicate check — within batch ────────────────
+const orders = rawQuestions.map(q => q.questionOrder);
+const uniqueOrders = new Set(orders);
+if (uniqueOrders.size !== orders.length)
+  throw new Error('BAD_REQUEST: Duplicate questionOrder values within the submitted batch');
 
-        for (const q of rawQuestions) {
-          const questionId = `question_${rand10()}`;
+// ── Duplicate check — against Firestore (chunked for >30) ──
+const orderChunks = [];
+const orderArr = [...uniqueOrders];
+for (let i = 0; i < orderArr.length; i += 30)
+  orderChunks.push(orderArr.slice(i, i + 30));
 
-          const docData = {
-            questionId,
-            questionType:  q.questionType,
-            questionText:  q.questionText.trim(),
-            questionOrder: q.questionOrder,
-            classId,
-            subjectId,
-            chapterId,
-            createdAt: now,
-            updatedAt: now,
-          };
+const existingMap = new Map(); // questionOrder → { questionId, docRef }
 
-          // Optional fields — only write if provided
-          if (q.questionImageUrl !== undefined) docData.questionImageUrl = q.questionImageUrl.trim();
-          if (q.solutionText     !== undefined) docData.solutionText     = String(q.solutionText).trim();
-          if (q.solutionVideoUrl !== undefined) docData.solutionVideoUrl = q.solutionVideoUrl.trim();
-          if (q.solutionImageUrl !== undefined) docData.solutionImageUrl = q.solutionImageUrl.trim();
+for (const chunk of orderChunks) {
+  const snap = await db.collection('questions')
+    .where('classId',       '==', classId)
+    .where('subjectId',     '==', subjectId)
+    .where('chapterId',     '==', chapterId)
+    .where('questionOrder', 'in', chunk)
+    .get();
 
-          // Objective-specific
-          if (q.questionType === 'Objective') {
-            docData.questionOptions = q.questionOptions.map(o => String(o).trim());
-            docData.correctIndex    = q.correctIndex;
-          }
+  snap.forEach(doc => {
+    const d = doc.data();
+    existingMap.set(d.questionOrder, { questionId: d.questionId, docRef: doc.ref });
+  });
+}
 
-          batch.set(db.collection('questions').doc(questionId), docData);
+// ── Batch upsert ───────────────────────────────────
+const batch   = db.batch();
+const results = [];
+const now     = admin.firestore.FieldValue.serverTimestamp();
 
-          created.push({ questionId, ...docData, createdAt: null, updatedAt: null });
-        }
+for (const q of rawQuestions) {
+  const existing   = existingMap.get(q.questionOrder);
+  const questionId = existing ? existing.questionId : `question_${rand10()}`;
+  const docRef     = existing ? existing.docRef     : db.collection('questions').doc(questionId);
+  const isUpdate   = !!existing;
 
-        await batch.commit();
-        logger.info({ classId, subjectId, chapterId, count: created.length }, '✅ Questions bulk created');
+  const docData = {
+    questionId,
+    questionType:  q.questionType,
+    questionText:  q.questionText.trim(),
+    questionOrder: q.questionOrder,
+    classId,
+    subjectId,
+    chapterId,
+    updatedAt: now,
+  };
 
-        return { success: true, created: created.length, questions: created };
-      });
+  // Preserve createdAt for updates, set it fresh for new docs
+  if (!isUpdate) docData.createdAt = now;
+
+  if (q.questionImageUrl !== undefined) docData.questionImageUrl = q.questionImageUrl.trim();
+  if (q.solutionText     !== undefined) docData.solutionText     = String(q.solutionText).trim();
+  if (q.solutionVideoUrl !== undefined) docData.solutionVideoUrl = q.solutionVideoUrl.trim();
+  if (q.solutionImageUrl !== undefined) docData.solutionImageUrl = q.solutionImageUrl.trim();
+
+  if (q.questionType === 'Objective') {
+    docData.questionOptions = q.questionOptions.map(o => String(o).trim());
+    docData.correctIndex    = q.correctIndex;
+  }
+
+  // merge: true preserves createdAt and any other fields not in docData
+  batch.set(docRef, docData, { merge: true });
+
+  results.push({ questionId, isUpdate, ...docData, createdAt: null, updatedAt: null });
+}
+
+await batch.commit();
+
+const updatedCount = results.filter(r => r.isUpdate).length;
+const createdCount = results.filter(r => !r.isUpdate).length;
+
+logger.info(
+  { classId, subjectId, chapterId, created: createdCount, updated: updatedCount },
+  '✅ Questions bulk upserted'
+);
+
+return {
+  success:   true,
+  created:   createdCount,
+  updated:   updatedCount,
+  questions: results,
+};
 
       res.status(201).json(result);
     } catch (err) {
