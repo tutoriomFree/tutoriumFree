@@ -84,7 +84,7 @@ app.use(cors({
     if (allowedOrigins.includes(origin)) return callback(null, true);
     callback(new Error(`CORS: Origin "${origin}" is not allowed`));
   },
-  allowedHeaders: ['Content-Type', 'X-Admin-Secret'],
+  allowedHeaders: ['Content-Type', 'X-Admin-Secret', 'Authorization'],
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
 }));
 
@@ -409,6 +409,40 @@ function requireAdminSecret(req, res, next) {
   if (req.headers['x-admin-secret'] !== secret)
     return res.status(403).json({ error: 'Forbidden' });
   next();
+}
+// ─────────────────────────────────────────────
+// Firebase Auth middleware — verifies Bearer token
+// ─────────────────────────────────────────────
+async function verifyFirebaseToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized: Missing Authorization header' });
+  }
+  const idToken = authHeader.split('Bearer ')[1];
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    logger.warn({ err }, '⚠️  Token verification failed');
+    return res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
+  }
+}
+// ─────────────────────────────────────────────
+// Permission check — verifies user has active
+// permission for the requested className
+// ─────────────────────────────────────────────
+async function checkQuestionPermission(uid, className) {
+  const now = admin.firestore.Timestamp.now();
+  const snap = await db.collection('permissions')
+    .where('userUId', '==', uid)
+    .where('permittedClass', '==', className)
+    .where('expireAt', '>', now)
+    .limit(1)
+    .get();
+  if (snap.empty) {
+    throw new Error('FORBIDDEN: You do not have permission to access questions for this class');
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -1276,12 +1310,16 @@ app.delete(
 //    400 – missing / invalid query params, or invalid cursor
 //    503 – queue full
 // ─────────────────────────────────────────────
-app.get('/questions', async (req, res) => {
+app.get('/questions', verifyFirebaseToken, async (req, res) => {
   try {
     const result = await QUEUES.read.add(async () => {
       requireDb();
       requireQueryParams(req.query, 'classId', 'subjectId', 'chapterId');
-
+      const { className } = req.body;
+      if (!className || typeof className !== 'string' || !className.trim()) {
+        throw new Error('BAD_REQUEST: className is required in the request body');
+      }
+      await checkQuestionPermission(req.user.uid, className.trim());
       const { classId, subjectId, chapterId } = req.query;
 
       // ── Optional cursor (questionOrder of last item from previous page) ──
