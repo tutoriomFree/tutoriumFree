@@ -1315,7 +1315,7 @@ app.get('/questions', verifyFirebaseToken, async (req, res) => {
     const result = await QUEUES.read.add(async () => {
       requireDb();
       requireQueryParams(req.query, 'classId', 'subjectId', 'chapterId');
-      const { className } = req.body;
+      const { className } = req.query;
       if (!className || typeof className !== 'string' || !className.trim()) {
         throw new Error('BAD_REQUEST: className is required in the request body');
       }
